@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/rsa"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
+
+	"golang.org/x/crypto/sha3"
 
 	irc "gopkg.in/sorcix/irc.v2"
 )
@@ -19,31 +22,30 @@ type Message struct {
 	Message string `json:"message"`
 }
 
-// ToMessage returns a message from a Message
-func (m *Message) ToMessage() (string, error) {
+// Encode returns a message from a Message
+func (m *Message) Encode() ([]byte, error) {
 	b := &bytes.Buffer{}
 	if err := json.NewEncoder(b).Encode(m); err != nil {
-		return "", err
+		return []byte{}, err
 	}
 
 	z := &bytes.Buffer{}
 	w := zlib.NewWriter(z)
 	_, err := w.Write(b.Bytes())
 	if err != nil {
-		return "", err
+		return []byte{}, err
 	}
 	w.Close()
 
-	b64 := make([]byte, base64.StdEncoding.EncodedLen(len(z.Bytes())))
-	base64.StdEncoding.Encode(b64, z.Bytes())
-	return string(b64), nil
+	b64 := make([]byte, base64.RawStdEncoding.EncodedLen(len(z.Bytes())))
+	base64.RawStdEncoding.Encode(b64, z.Bytes())
+	return b64, nil
 }
 
-// FromMessage returns a message from an irc message
-func FromMessage(m *irc.Message) (*Message, error) {
-	b64 := make([]byte, base64.StdEncoding.DecodedLen(len([]byte(m.Params[1]))))
-	base64.StdEncoding.Decode(b64, []byte(m.Params[1]))
-	fmt.Println(m.Params[1], "->", string(b64))
+// DecodeMessage returns a message from an irc message
+func DecodeMessage(b []byte) (*Message, error) {
+	b64 := make([]byte, base64.RawStdEncoding.DecodedLen(len(b)))
+	base64.RawStdEncoding.Decode(b64, b)
 	// Zip
 	z, err := zlib.NewReader(bytes.NewBuffer(b64))
 	if err != nil {
@@ -61,28 +63,94 @@ func FromMessage(m *irc.Message) (*Message, error) {
 // Bot represents the bot
 type Bot struct {
 	Nick     string
+	Chan     string
+	Users    map[string][]byte
 	Messages <-chan *irc.Message
 	conn     *irc.Conn
+	key      *rsa.PrivateKey
 }
 
 // NewBot returns an initialized bot
 func NewBot(conn *irc.Conn) (*Bot, error) {
-	in := make([]byte, 12)
-	rand.Read(in)
-	nick := make([]byte, base32.StdEncoding.EncodedLen(len(in)))
-	base32.StdEncoding.Encode(nick, in)
-
 	mc := make(chan *irc.Message)
 
+	// Channel is a hash of some shared information
+	hash := make([]byte, 12)
+	sha3.ShakeSum256(hash, []byte("connor+dylan"))
+	channel := "#" + base64.RawURLEncoding.EncodeToString(hash)
+
+	// Generate private key
+	key, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, err
+	}
+
+	// JSON encoded base64'd public key serves as nick
+	jpk, err := json.Marshal(key.Public())
+	if err != nil {
+		return nil, err
+	}
+	nick := make([]byte, base64.RawURLEncoding.EncodedLen(len(jpk)))
+	base64.RawURLEncoding.Encode(nick, jpk)
+
 	b := &Bot{
-		Nick:     string(nick),
+		Nick:     string(nick[:16]), // First 16 bytes
+		Chan:     channel,
 		Messages: mc,
 		conn:     conn,
+		key:      key,
 	}
 
 	go b.Listen(mc)
 
+	go func() {
+
+		if err := b.connect(channel); err != nil {
+			log.Fatal(err)
+		}
+
+		// Identify with public key
+		mb, err := (&Message{
+			Message: "hey!",
+		}).Encode()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Send initial message
+		if _, err := b.Write(mb); err != nil {
+			log.Print(err)
+		}
+
+		// Churn through write requests
+	}()
+
 	return b, nil
+}
+
+// Write 128-byte blocks for every IRC message
+func (b *Bot) Write(buf []byte) (int, error) {
+	// Write in 128-byte chunks in as privmsg's to recipient
+	// Write to channel
+	const step = 128
+	for i := 0; i < len(buf); i += step {
+		if err := b.conn.Encode(&irc.Message{
+			Command: irc.PRIVMSG,
+			Params:  []string{b.Chan, string(buf[i:int(math.Min(float64(i+step), float64(len(buf))))])},
+		}); err != nil {
+			log.Print(err)
+		}
+	}
+
+	// End of message marker
+	if err := b.conn.Encode(&irc.Message{
+		Command: irc.PRIVMSG,
+		Params:  []string{b.Chan, "EOM"},
+	}); err != nil {
+		log.Print(err)
+	}
+
+	return 0, nil
 }
 
 // Listen listens and responds to messages
@@ -106,41 +174,36 @@ func (b *Bot) Listen(c chan<- *irc.Message) error {
 	}
 }
 
-// Encode encodes a message on Bot's channel
-func (b *Bot) Encode(m *irc.Message) error {
-	return b.conn.Encode(m)
-}
-
 // Channel connects a bot to a channel
-func (b *Bot) Channel(channel string) error {
+func (b *Bot) connect(channel string) error {
 	// Generate a random password
 	in := make([]byte, 64)
 	rand.Read(in)
 	pass := make([]byte, base32.StdEncoding.EncodedLen(len(in)))
 	base32.StdEncoding.Encode(pass, in)
 
-	if err := b.Encode(&irc.Message{
+	if err := b.conn.Encode(&irc.Message{
 		Command: irc.PASS,
 		Params:  []string{string(pass)},
 	}); err != nil {
 		return err
 	}
 
-	if err := b.Encode(&irc.Message{
+	if err := b.conn.Encode(&irc.Message{
 		Command: irc.NICK,
 		Params:  []string{b.Nick},
 	}); err != nil {
 		return err
 	}
 
-	if err := b.Encode(&irc.Message{
+	if err := b.conn.Encode(&irc.Message{
 		Command: irc.USER,
 		Params:  []string{b.Nick, "0", b.Nick, b.Nick},
 	}); err != nil {
 		return err
 	}
 
-	if err := b.Encode(&irc.Message{
+	if err := b.conn.Encode(&irc.Message{
 		Command: irc.JOIN,
 		Params:  []string{channel},
 	}); err != nil {
@@ -161,35 +224,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	sum := sha1.Sum([]byte("connor+dylan"))
-	channel := "#" + base64.URLEncoding.EncodeToString(sum[:])
-
-	go func() {
-		if err := b.Channel(channel); err != nil {
-			log.Fatal(err)
-		}
-
-		// Compose message
-		s, err := (&Message{
-			Message: "hey!",
-		}).ToMessage()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Send initial message
-		if err := b.conn.Encode(&irc.Message{
-			Command: irc.PRIVMSG,
-			Params:  []string{channel, s},
-		}); err != nil {
-			log.Print(err)
-		}
-	}()
-
 	for msg := range b.Messages {
-		fmt.Println(msg)
+		if msg.Command != irc.RPL_MOTD {
+			fmt.Println(msg)
+		}
 		if msg.Command == irc.PRIVMSG {
-			m, err := FromMessage(msg)
+			m, err := DecodeMessage([]byte(msg.Params[1]))
 			if err != nil {
 				log.Print(err)
 				continue
@@ -197,11 +237,13 @@ func main() {
 
 			if err := b.conn.Encode(&irc.Message{
 				Command: irc.PRIVMSG,
-				Params:  []string{channel, m.Message},
+				Params:  []string{msg.Prefix.Name, m.Message},
 			}); err != nil {
 				log.Print(err)
 				continue
 			}
+
+			fmt.Println(m)
 		}
 	}
 
