@@ -4,112 +4,178 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/gob"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"sync"
+	"os"
 
 	"github.com/cptaffe/brk"
 )
 
-// serve on random ports
-func server(c chan<- bool, r *rsa.PublicKey) error {
-	k, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		log.Fatal(err)
-	}
+// Config holds client configuration options
+type Config struct {
+	PrivateKey *rsa.PrivateKey `json:"private_key"`
+	NoServer   bool            `json:"no_server,omitempty"`
+	// Peers list of known nodes
+	Peers []string `json:"peers,omitempty"`
+	// Friends mapping from nickname to public-key
+	Friends map[string]*rsa.PublicKey `json:"friends,omitempty"`
+	Server  struct {
+		Port int `json:"port,omitempty"`
+	} `json:"server,omitempty"`
+}
 
-	b, err := brk.NewBrk(k)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	ln, err := net.Listen("tcp", ":3030")
+func server(b *brk.Brk, conf *Config) error {
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", conf.Server.Port))
 	if err != nil {
 		return err
 	}
-	c <- true
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go func(conn net.Conn) {
-			if err := b.AddConn(conn); err != nil {
-				panic(err)
-			}
 
-			s := b.NewSender(&brk.Node{PublicKey: r})
-			if err := gob.NewEncoder(s).Encode("Hey!"); err != nil {
-				panic(err)
-			}
-			s.Close()
-
-			for blk := range b.Blocks {
-				var str string
-				if err := gob.NewDecoder(bytes.NewBuffer(blk.Payload)).Decode(&str); err != nil {
-					log.Fatal(err)
-				}
-
-				s := b.NewSender(blk.From)
-				if err := gob.NewEncoder(s).Encode(str); err != nil {
-					panic(err)
-				}
-				s.Close()
-			}
-		}(conn)
+		if err := b.AddConn(conn); err != nil {
+			return err
+		}
 	}
 }
 
+func genConfigPath() (string, error) {
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		return "", errors.New("HOME not set")
+	}
+	return homeDir + "/.config/brk.json", nil
+}
+
+func readConfig() (*Config, error) {
+	confFile, err := genConfigPath()
+	if err != nil {
+		return nil, err
+	}
+	conf := &Config{}
+	f, err := os.Open(confFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	} else {
+		if err := json.NewDecoder(f).Decode(conf); err != nil {
+			return nil, err
+		}
+	}
+	return conf, nil
+}
+
+func writeConfig(conf *Config) error {
+	confFile, err := genConfigPath()
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(confFile)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(conf)
+	if err != nil {
+		return err
+	}
+	var out bytes.Buffer
+	if err := json.Indent(&out, b, "", "\t"); err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, &out); err != nil {
+		return err
+	}
+	return nil
+}
+
 func main() {
-	k, err := rsa.GenerateKey(rand.Reader, 4096)
+	// Try to open .config/brk.json
+	conf, err := readConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	b, err := brk.NewBrk(k)
+	if conf.PrivateKey == nil {
+		// Generate RSA key
+		k, err := rsa.GenerateKey(rand.Reader, 4096)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		conf.PrivateKey = k
+	}
+
+	if conf.Server.Port == 0 {
+		conf.Server.Port = 3030
+	}
+
+	if len(conf.Friends) == 0 {
+		if conf.Friends == nil {
+			conf.Friends = make(map[string]*rsa.PublicKey)
+		}
+		conf.Friends["self"] = &conf.PrivateKey.PublicKey
+	}
+
+	// Write parsed conf version
+	if err := writeConfig(conf); err != nil {
+		log.Fatal(err)
+	}
+
+	b, err := brk.NewBrk(conf.PrivateKey)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	c := make(chan bool)
-	go server(c, &k.PublicKey)
-	<-c // server is listening
-
-	nc, err := net.Dial("tcp", "127.0.0.1:3030")
-	if err != nil {
-		log.Fatal(err)
+	if !conf.NoServer {
+		fmt.Printf("Serving at %d\n", conf.Server.Port)
+		go server(b, conf)
 	}
 
-	if err := b.AddConn(nc); err != nil {
-		log.Fatal(err)
+	// Connect to some peers?
+	for _, peerAddr := range conf.Peers {
+		nc, err := net.Dial("tcp", peerAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if err := b.AddConn(nc); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	// Listen for messages
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			j := 0
-			for blk := range b.Blocks {
-				// Decode message
-				str := ""
-				if err := gob.NewDecoder(bytes.NewBuffer(blk.Payload)).Decode(&str); err != nil {
-					log.Fatal(err)
-				}
+	// List blocks as they are received
+	go func() {
+		// Listen for blocks
+		for blk := range b.Blocks {
+			fmt.Println(string(blk.Payload))
+		}
+	}()
 
-				// Echo client
-				s := b.NewSender(blk.From)
-				if err := gob.NewEncoder(s).Encode(fmt.Sprint(i, j)); err != nil {
-					panic(err)
-				}
-				s.Close()
-				j++
-				fmt.Println(str)
-			}
-		}(i)
+	for {
+		var nick string
+		var msg string
+		if _, err := fmt.Scanf("%s %s", &nick, &msg); err != nil {
+			log.Fatal(err)
+		}
+
+		k := conf.Friends[nick]
+		if k == nil {
+			log.Printf("Unknown friend '%s'", nick)
+			continue
+		}
+
+		s := b.NewSender(&brk.Node{PublicKey: k})
+		if _, err := s.Write([]byte(msg)); err != nil {
+			log.Fatal(err)
+		}
+		s.Close()
 	}
-	wg.Wait()
 }
