@@ -168,7 +168,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		ss := strings.SplitN(s, ": ", 2)
+		ss := strings.SplitN(s, ":", 2)
 		if len(ss) != 2 {
 			log.Print("Expected 'nick: message' format")
 			continue
