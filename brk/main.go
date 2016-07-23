@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/cptaffe/brk"
 )
@@ -159,12 +161,21 @@ func main() {
 		}
 	}()
 
+	r := bufio.NewReader(os.Stdin)
 	for {
-		var nick string
-		var msg string
-		if _, err := fmt.Scanf("%s %s", &nick, &msg); err != nil {
+		s, err := r.ReadString('\n')
+		if err != nil {
 			log.Fatal(err)
 		}
+
+		ss := strings.SplitN(s, ": ", 2)
+		if len(ss) != 2 {
+			log.Print("Expected 'nick: message' format")
+			continue
+		}
+
+		nick := ss[0]
+		msg := strings.Trim(ss[1], "\n\r\t ")
 
 		k := conf.Friends[nick]
 		if k == nil {
@@ -172,10 +183,10 @@ func main() {
 			continue
 		}
 
-		s := b.NewSender(&brk.Node{PublicKey: k})
-		if _, err := s.Write([]byte(msg)); err != nil {
+		sndr := b.NewSender(&brk.Node{PublicKey: k})
+		if _, err := sndr.Write([]byte(msg)); err != nil {
 			log.Fatal(err)
 		}
-		s.Close()
+		sndr.Close()
 	}
 }
